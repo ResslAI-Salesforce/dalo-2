@@ -1,0 +1,356 @@
+/**
+ * @openclaw/channel-vapi — VAPI voice channel plugin for OpenClaw.
+ *
+ * Registers VAPI as a first-class message channel with:
+ *   - Channel identity (shows up in /channels, /status, config UI)
+ *   - Webhook service (Fastify server for VAPI's custom LLM endpoint)
+ *   - Agent tool (vapi_call for outbound phone calls)
+ *   - Gateway RPC methods (vapi.call, vapi.status)
+ *
+ * Architecture:
+ *
+ *   Caller ──► VAPI Cloud (STT) ──► POST /chat/completions ──► webhook service
+ *                                                                    │
+ *                    VAPI Cloud (TTS) ◄── SSE stream ◄──────────────┘
+ *                         │
+ *                    Caller hears speech
+ */
+
+import type {
+  OpenClawPluginApi,
+  GatewayRequestHandlerOptions,
+  OpenClawPluginService,
+} from "openclaw/plugin-sdk";
+import fastifyFormBody from "@fastify/formbody";
+import { Type } from "@sinclair/typebox";
+import Fastify, { type FastifyRequest, type FastifyReply } from "fastify";
+import { randomUUID } from "node:crypto";
+import type { VapiChatRequest, VapiPluginConfig, VapiServerEvent } from "./types.js";
+import { createVapiChannelPlugin } from "./channel.js";
+import { OutboundManager } from "./outbound.js";
+import { startStream, writeChunk, endStream, sendAndClose } from "./streaming.js";
+
+// ─── Plugin Definition ──────────────────────────────────────────────────────
+
+const vapiPlugin = {
+  id: "vapi",
+  name: "VAPI Voice Channel",
+  description: "Voice calls via VAPI — inbound/outbound phone calls with real-time STT/TTS.",
+
+  configSchema: {
+    parse(value: unknown): VapiPluginConfig {
+      const raw =
+        value && typeof value === "object" && !Array.isArray(value)
+          ? (value as Record<string, unknown>)
+          : {};
+      return {
+        api_key: typeof raw.api_key === "string" ? raw.api_key : "",
+        webhook_port: typeof raw.webhook_port === "number" ? raw.webhook_port : 3001,
+        assistant_id: typeof raw.assistant_id === "string" ? raw.assistant_id : undefined,
+        phone_number_id: typeof raw.phone_number_id === "string" ? raw.phone_number_id : undefined,
+        default_greeting:
+          typeof raw.default_greeting === "string" ? raw.default_greeting : undefined,
+        host: typeof raw.host === "string" ? raw.host : undefined,
+      };
+    },
+    uiHints: {
+      api_key: { label: "VAPI API Key", sensitive: true },
+      webhook_port: { label: "Webhook Port", placeholder: "3001" },
+      assistant_id: { label: "Assistant ID (outbound)" },
+      phone_number_id: { label: "Phone Number ID (outbound)" },
+      default_greeting: { label: "Default Greeting", placeholder: "Hey! How can I help?" },
+      host: { label: "Server Bind Address", placeholder: "0.0.0.0", advanced: true },
+    },
+  },
+
+  register(api: OpenClawPluginApi) {
+    const config = vapiPlugin.configSchema.parse(api.pluginConfig);
+    const logger = api.logger;
+
+    let outbound: OutboundManager | null = null;
+    let fastify: ReturnType<typeof Fastify> | null = null;
+
+    // Bridge plugin logger to the shape OutboundManager expects
+    const logBridge = {
+      info: (...args: unknown[]) => logger.info(args.map(String).join(" ")),
+      error: (...args: unknown[]) => logger.error(args.map(String).join(" ")),
+    };
+
+    // ── Channel Registration ──────────────────────────────────────────────
+
+    const channelPlugin = createVapiChannelPlugin({
+      getOutbound: () => outbound,
+    });
+
+    api.registerChannel({ plugin: channelPlugin });
+
+    // ── Webhook Service ───────────────────────────────────────────────────
+    //
+    // Runs a Fastify HTTP server that receives VAPI webhooks.
+    // VAPI sends transcribed speech to /chat/completions and expects
+    // SSE streaming responses in OpenAI format.
+
+    const webhookService: OpenClawPluginService = {
+      id: "vapi-webhook",
+
+      start: async () => {
+        if (!config.api_key) {
+          logger.warn("[vapi] No api_key configured — webhook service not started");
+          return;
+        }
+
+        outbound = new OutboundManager(config, logBridge);
+        fastify = Fastify();
+        await fastify.register(fastifyFormBody);
+
+        // ── POST /chat/completions ────────────────────────────────────────
+        //
+        // Main endpoint. VAPI sends transcribed speech here.
+        // We identify the caller, route to the agent, stream the response.
+        //
+        //   1. VAPI transcribes caller speech
+        //   2. Sends OpenAI-format messages array + call metadata
+        //   3. We extract latest user message
+        //   4. Build session key from caller phone number
+        //   5. Route to agent via channel reply pipeline
+        //   6. Stream agent tokens back as SSE chunks
+        //   7. VAPI pipes chunks to TTS → caller hears response in real time
+
+        fastify.post("/chat/completions", async (request: FastifyRequest, reply: FastifyReply) => {
+          const body = request.body as VapiChatRequest;
+          const call = body.call;
+          const callId = call?.id || randomUUID();
+          const callerNumber = call?.customer?.number || "unknown";
+          const isOutbound = call?.type === "outboundPhoneCall";
+
+          logger.info(
+            `[vapi] ${isOutbound ? "outbound" : "inbound"} call ${callId} from ${callerNumber}`,
+          );
+
+          // Extract latest user message from the conversation history
+          const userMessages = body.messages?.filter((m) => m.role === "user") || [];
+          const latestMessage = userMessages[userMessages.length - 1]?.content;
+
+          // No user message yet — VAPI is asking for the initial greeting.
+          // This happens when the call first connects (assistant-speaks-first mode).
+          if (!latestMessage) {
+            logger.info("[vapi] No user message — sending greeting");
+            const greeting = config.default_greeting || "Hey! How can I help?";
+            sendAndClose(reply.raw, callId, greeting);
+            return;
+          }
+
+          // Start SSE stream — we'll write chunks as the agent generates tokens
+          startStream(reply.raw);
+
+          // Check for outbound call context (injected when we initiated the call)
+          let systemContext: string | undefined;
+          if (outbound) {
+            const outboundCtx = outbound.consumeContext(callId);
+            if (outboundCtx) {
+              systemContext =
+                `This is an outbound call you initiated to ${outboundCtx.calleeName || outboundCtx.calleeNumber}. ` +
+                `Context: ${outboundCtx.context}`;
+            }
+          }
+
+          try {
+            // Route to the agent via the channel pipeline.
+            const cfg = api.config;
+            const route = api.runtime.channel.routing.resolveAgentRoute({
+              cfg,
+              channel: "vapi",
+              peer: { kind: "direct", id: callerNumber },
+            });
+
+            const sessionKey = route.sessionKey ?? `agent:main:vapi:dm:${callerNumber}`;
+
+            // Build MsgContext for the inbound message
+            const msgCtx = api.runtime.channel.reply.finalizeInboundContext({
+              Body: latestMessage,
+              From: callerNumber,
+              To: callerNumber,
+              SessionKey: sessionKey,
+              ChatType: "direct",
+              Provider: "vapi",
+              Surface: "vapi",
+              SenderId: callerNumber,
+              SenderE164: callerNumber,
+              ...(systemContext ? { UntrustedContext: [systemContext] } : {}),
+            });
+
+            // Create a dispatcher that streams SSE to the VAPI connection.
+            // This replaces the normal outbound.sendText flow because VAPI
+            // requires the response on the same HTTP connection.
+            const { dispatcher, replyOptions, markDispatchIdle } =
+              api.runtime.channel.reply.createReplyDispatcherWithTyping({
+                deliver: async (payload: { text?: string }) => {
+                  const text = payload?.text;
+                  if (text) {
+                    writeChunk(reply.raw, callId, text);
+                  }
+                },
+              });
+
+            await api.runtime.channel.reply.dispatchReplyFromConfig({
+              ctx: msgCtx,
+              cfg,
+              dispatcher,
+              replyOptions,
+            });
+
+            markDispatchIdle?.();
+            endStream(reply.raw, callId);
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            logger.error(`[vapi] Call ${callId} agent error: ${msg}`);
+            writeChunk(reply.raw, callId, "Sorry, something went wrong. Please try again.");
+            endStream(reply.raw, callId);
+          }
+        });
+
+        // ── POST /events ──────────────────────────────────────────────────
+        //
+        // VAPI server events: status updates, end-of-call reports, transcripts.
+        // Informational — no response body needed (just 200 OK).
+
+        fastify.post("/events", async (request: FastifyRequest, reply: FastifyReply) => {
+          const event = request.body as VapiServerEvent;
+          const type = event?.message?.type;
+          const callId = event?.message?.call?.id;
+
+          switch (type) {
+            case "end-of-call-report": {
+              const report = event.message as Record<string, unknown>;
+              logger.info(
+                `[vapi] Call ${callId} ended — reason=${report.endedReason} duration=${report.durationSeconds}s`,
+              );
+              break;
+            }
+            case "status-update":
+              logger.info(`[vapi] Call ${callId} status: ${event.message.call?.status}`);
+              break;
+            case "transcript":
+              break;
+            default:
+              logger.info(`[vapi] Event: ${type} for call ${callId}`);
+          }
+
+          reply.status(200).send({ ok: true });
+        });
+
+        // Start the server
+        const port = config.webhook_port;
+        const host = config.host || "0.0.0.0";
+        await fastify.listen({ port, host });
+        logger.info(`[vapi] Webhook server listening on ${host}:${port}`);
+        logger.info(`[vapi] Custom LLM endpoint: http://${host}:${port}/chat/completions`);
+        logger.info(`[vapi] Events endpoint: http://${host}:${port}/events`);
+        if (config.assistant_id && config.phone_number_id) {
+          logger.info("[vapi] Outbound calls enabled (tool: vapi_call)");
+        }
+      },
+
+      stop: async () => {
+        if (fastify) {
+          await fastify.close();
+          fastify = null;
+          logger.info("[vapi] Webhook server stopped");
+        }
+        outbound = null;
+      },
+    };
+
+    api.registerService(webhookService);
+
+    // ── Agent Tool: vapi_call ───────────────────────────────────────────
+    //
+    // Lets the agent make outbound phone calls.
+    // "Call +15551234567 and ask about the deploy"
+    //   → agent invokes vapi_call tool
+    //   → plugin calls VAPI API to dial the number
+    //   → callee picks up, VAPI calls /chat/completions
+    //   → agent sees stored context and converses with callee
+
+    const VapiCallSchema = Type.Object({
+      to: Type.String({ description: "Phone number to call in E.164 format (e.g. +15551234567)" }),
+      greeting: Type.Optional(Type.String({ description: "What to say when the callee picks up" })),
+      context: Type.Optional(
+        Type.String({
+          description: "Context for the conversation — injected when callee responds",
+        }),
+      ),
+    });
+
+    api.registerTool(
+      {
+        name: "vapi_call",
+        label: "VAPI Call",
+        description:
+          "Make an outbound phone call via VAPI. " +
+          "Provide a phone number, an optional greeting (what to say when they answer), " +
+          "and optional context (why you're calling — you'll see this when they respond).",
+        parameters: VapiCallSchema,
+        async execute(
+          _toolCallId: string,
+          params: { to: string; greeting?: string; context?: string },
+        ) {
+          const json = (payload: unknown) => ({
+            content: [{ type: "text" as const, text: JSON.stringify(payload, null, 2) }],
+            details: payload,
+          });
+
+          if (!outbound) {
+            return json({ error: "VAPI outbound not initialized — check plugin config" });
+          }
+
+          const result = await outbound.call(params.to, params.greeting, params.context);
+          if (!result.success) {
+            return json({ error: result.error });
+          }
+          return json({ callId: result.callId, message: `Calling ${params.to}...` });
+        },
+      },
+      { names: ["vapi_call"], optional: true },
+    );
+
+    // ── Gateway RPC Methods ─────────────────────────────────────────────
+
+    api.registerGatewayMethod(
+      "vapi.call",
+      async ({ params, respond }: GatewayRequestHandlerOptions) => {
+        if (!outbound) {
+          respond(false, { error: "VAPI outbound not initialized" });
+          return;
+        }
+        const to = typeof params?.to === "string" ? params.to.trim() : "";
+        const greeting = typeof params?.greeting === "string" ? params.greeting.trim() : undefined;
+        const context = typeof params?.context === "string" ? params.context.trim() : undefined;
+        if (!to) {
+          respond(false, { error: "to required" });
+          return;
+        }
+        try {
+          const result = await outbound.call(to, greeting, context);
+          if (!result.success) {
+            respond(false, { error: result.error });
+            return;
+          }
+          respond(true, { callId: result.callId, message: `Calling ${to}...` });
+        } catch (err) {
+          respond(false, { error: err instanceof Error ? err.message : String(err) });
+        }
+      },
+    );
+
+    api.registerGatewayMethod("vapi.status", async ({ respond }: GatewayRequestHandlerOptions) => {
+      respond(true, {
+        running: fastify !== null,
+        port: config.webhook_port,
+        outboundEnabled: Boolean(config.assistant_id && config.phone_number_id),
+      });
+    });
+  },
+};
+
+export default vapiPlugin;
