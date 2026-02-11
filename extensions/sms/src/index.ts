@@ -67,6 +67,7 @@ const smsPlugin = {
         phone_number: typeof raw.phone_number === "string" ? raw.phone_number : "",
         webhook_port: typeof raw.webhook_port === "number" ? raw.webhook_port : 3002,
         host: typeof raw.host === "string" ? raw.host : undefined,
+        webhook_url: typeof raw.webhook_url === "string" ? raw.webhook_url : undefined,
       };
     },
     uiHints: {
@@ -145,13 +146,25 @@ const smsPlugin = {
           // Validate Twilio signature if auth_token is configured
           const signature = request.headers["x-twilio-signature"] as string | undefined;
           if (signature && config.auth_token) {
-            const webhookUrl = `${request.protocol}://${request.hostname}${request.url}`;
+            // Reconstruct the public URL that Twilio signed against:
+            // 1. Explicit webhook_url config (most reliable for prod)
+            // 2. x-forwarded-* headers (from ngrok/reverse proxy)
+            // 3. Local request info (fallback)
+            let webhookUrl: string;
+            if (config.webhook_url) {
+              const base = config.webhook_url.replace(/\/+$/, "");
+              webhookUrl = `${base}${request.url}`;
+            } else {
+              const proto = (request.headers["x-forwarded-proto"] as string) || request.protocol;
+              const host = (request.headers["x-forwarded-host"] as string) || request.hostname;
+              webhookUrl = `${proto}://${host}${request.url}`;
+            }
             const params: Record<string, string> = {};
             for (const [key, value] of Object.entries(body)) {
               if (typeof value === "string") params[key] = value;
             }
             if (!validateTwilioSignature(config.auth_token, signature, webhookUrl, params)) {
-              logger.warn(`[sms] Invalid Twilio signature for ${messageSid}`);
+              logger.warn(`[sms] Invalid Twilio signature for ${messageSid} (url=${webhookUrl})`);
               reply.status(403).send("Invalid signature");
               return;
             }

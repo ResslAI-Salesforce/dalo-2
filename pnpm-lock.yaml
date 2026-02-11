@@ -506,6 +506,25 @@ importers:
         specifier: workspace:*
         version: link:../..
 
+  extensions/sms:
+    dependencies:
+      '@fastify/formbody':
+        specifier: ^8.0.0
+        version: 8.0.2
+      fastify:
+        specifier: ^5.0.0
+        version: 5.7.4
+      openclaw:
+        specifier: '*'
+        version: 2026.2.9(@napi-rs/canvas@0.1.91)(@types/express@5.0.6)(audio-decode@2.2.3)(node-llama-cpp@3.15.1(typescript@5.9.3))(signal-polyfill@0.2.2)
+    devDependencies:
+      '@sinclair/typebox':
+        specifier: 0.34.48
+        version: 0.34.48
+      typescript:
+        specifier: ^5.5.0
+        version: 5.9.3
+
   extensions/telegram:
     devDependencies:
       openclaw:

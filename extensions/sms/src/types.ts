@@ -52,6 +52,8 @@ export interface SmsPluginConfig {
   webhook_port: number;
   /** Host to bind the server to (default: 0.0.0.0) */
   host?: string;
+  /** Public base URL for Twilio signature validation (e.g. https://example.ngrok.dev) */
+  webhook_url?: string;
 }
 
 // ─── Channel account ────────────────────────────────────────────────────────

@@ -24,6 +24,9 @@
       "host": {
         "type": "string"
       },
+      "webhook_url": {
+        "type": "string"
+      },
       "allowFrom": {
         "type": "array",
         "items": {
@@ -58,6 +61,12 @@
     "host": {
       "label": "Server Bind Address",
       "placeholder": "0.0.0.0",
+      "advanced": true
+    },
+    "webhook_url": {
+      "label": "Public Webhook URL",
+      "placeholder": "https://example.ngrok.dev",
+      "help": "Public base URL for Twilio signature validation. Set this if behind a reverse proxy.",
       "advanced": true
     },
     "allowFrom": {
