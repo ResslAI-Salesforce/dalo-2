@@ -288,7 +288,7 @@ const smsPlugin = {
           return json({ sid: result.sid, message: `SMS sent to ${params.to}` });
         },
       },
-      { names: ["sms_send"], optional: true },
+      { names: ["sms_send"], optional: false },
     );
 
     // ── Gateway RPC Methods ─────────────────────────────────────────────
