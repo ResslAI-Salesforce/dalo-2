@@ -1,7 +1,6 @@
 {
   "id": "vapi",
   "channels": ["vapi"],
-  "skills": ["./skills"],
   "configSchema": {
     "type": "object",
     "additionalProperties": false,

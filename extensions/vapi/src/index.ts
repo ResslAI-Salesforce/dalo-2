@@ -1,11 +1,11 @@
 /**
- * @openclaw/channel-vapi — VAPI voice channel plugin for OpenClaw.
+ * @openclaw/vapi — VAPI voice channel plugin for OpenClaw.
  *
  * Registers VAPI as a first-class message channel with:
  *   - Channel identity (shows up in /channels, /status, config UI)
  *   - Webhook service (Fastify server for VAPI's custom LLM endpoint)
- *   - Agent tool (vapi_call for outbound phone calls)
- *   - Gateway RPC methods (vapi.call, vapi.status)
+ *
+ * Outbound calls are handled via the voice-calls skill (shell scripts).
  *
  * Architecture:
  *
@@ -16,13 +16,8 @@
  *                    Caller hears speech
  */
 
-import type {
-  OpenClawPluginApi,
-  GatewayRequestHandlerOptions,
-  OpenClawPluginService,
-} from "openclaw/plugin-sdk";
+import type { OpenClawPluginApi, OpenClawPluginService } from "openclaw/plugin-sdk";
 import fastifyFormBody from "@fastify/formbody";
-import { Type } from "@sinclair/typebox";
 import Fastify, { type FastifyRequest, type FastifyReply } from "fastify";
 import { randomUUID } from "node:crypto";
 import type { VapiChatRequest, VapiPluginConfig, VapiServerEvent } from "./types.js";
@@ -247,7 +242,7 @@ const vapiPlugin = {
         logger.info(`[vapi] Custom LLM endpoint: http://${host}:${port}/chat/completions`);
         logger.info(`[vapi] Events endpoint: http://${host}:${port}/events`);
         if (config.assistant_id && config.phone_number_id) {
-          logger.info("[vapi] Outbound calls enabled (tool: vapi_call)");
+          logger.info("[vapi] Outbound calls enabled (via voice-calls skill)");
         }
       },
 
@@ -262,94 +257,6 @@ const vapiPlugin = {
     };
 
     api.registerService(webhookService);
-
-    // ── Agent Tool: vapi_call ───────────────────────────────────────────
-    //
-    // Lets the agent make outbound phone calls.
-    // "Call +15551234567 and ask about the deploy"
-    //   → agent invokes vapi_call tool
-    //   → plugin calls VAPI API to dial the number
-    //   → callee picks up, VAPI calls /chat/completions
-    //   → agent sees stored context and converses with callee
-
-    const VapiCallSchema = Type.Object({
-      to: Type.String({ description: "Phone number to call in E.164 format (e.g. +15551234567)" }),
-      greeting: Type.Optional(Type.String({ description: "What to say when the callee picks up" })),
-      context: Type.Optional(
-        Type.String({
-          description: "Context for the conversation — injected when callee responds",
-        }),
-      ),
-    });
-
-    api.registerTool(
-      {
-        name: "vapi_call",
-        label: "VAPI Call",
-        description:
-          "Make an outbound phone call via VAPI. " +
-          "Provide a phone number, an optional greeting (what to say when they answer), " +
-          "and optional context (why you're calling — you'll see this when they respond).",
-        parameters: VapiCallSchema,
-        async execute(
-          _toolCallId: string,
-          params: { to: string; greeting?: string; context?: string },
-        ) {
-          const json = (payload: unknown) => ({
-            content: [{ type: "text" as const, text: JSON.stringify(payload, null, 2) }],
-            details: payload,
-          });
-
-          if (!outbound) {
-            return json({ error: "VAPI outbound not initialized — check plugin config" });
-          }
-
-          const result = await outbound.call(params.to, params.greeting, params.context);
-          if (!result.success) {
-            return json({ error: result.error });
-          }
-          return json({ callId: result.callId, message: `Calling ${params.to}...` });
-        },
-      },
-      { names: ["vapi_call"], optional: true },
-    );
-
-    // ── Gateway RPC Methods ─────────────────────────────────────────────
-
-    api.registerGatewayMethod(
-      "vapi.call",
-      async ({ params, respond }: GatewayRequestHandlerOptions) => {
-        if (!outbound) {
-          respond(false, { error: "VAPI outbound not initialized" });
-          return;
-        }
-        const to = typeof params?.to === "string" ? params.to.trim() : "";
-        const greeting = typeof params?.greeting === "string" ? params.greeting.trim() : undefined;
-        const context = typeof params?.context === "string" ? params.context.trim() : undefined;
-        if (!to) {
-          respond(false, { error: "to required" });
-          return;
-        }
-        try {
-          const result = await outbound.call(to, greeting, context);
-          if (!result.success) {
-            respond(false, { error: result.error });
-            return;
-          }
-          respond(true, { callId: result.callId, message: `Calling ${to}...` });
-        } catch (err) {
-          respond(false, { error: err instanceof Error ? err.message : String(err) });
-        }
-      },
-    );
-
-    api.registerGatewayMethod("vapi.status", async ({ respond }: GatewayRequestHandlerOptions) => {
-      respond(true, {
-        running: fastify !== null,
-        port: config.webhook_port,
-        outboundEnabled: Boolean(config.assistant_id && config.phone_number_id),
-      });
-    });
   },
 };
 

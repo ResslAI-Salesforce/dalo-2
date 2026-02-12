@@ -1,8 +1,6 @@
 ---
-name: voice-calls
-description: Make outbound phone calls and understand inbound voice interactions
-tools:
-  - vapi_call
+name: voice-call
+description: Make outbound phone calls and manage call interactions via VAPI
 ---
 
 # Voice Calls
@@ -11,9 +9,7 @@ You can make and receive phone calls via VAPI.
 
 ## Inbound Calls
 
-When someone calls in, you receive their transcribed speech as regular messages. Respond conversationally — keep responses concise since the caller is listening in real time. Long responses cause awkward pauses.
-
-Tips for voice responses:
+When someone calls in, you receive their transcribed speech as regular messages. Respond conversationally — keep responses concise since the caller is listening in real time.
 
 - Keep it under 2-3 sentences when possible
 - Avoid markdown, bullet points, code blocks — the caller hears raw text
@@ -22,11 +18,28 @@ Tips for voice responses:
 
 ## Outbound Calls
 
-Use the `vapi_call` tool to call someone. You need:
+To make an outbound call, use the script at `scripts/make-call.sh` via `exec`.
 
-- **to** (required): Phone number in E.164 format (e.g., +15551234567)
-- **greeting** (optional): What to say when they pick up. If omitted, the default assistant greeting plays.
-- **context** (optional): Why you're calling. This gets injected back into your context when the callee responds, so you remember the purpose.
+### Usage
+
+```bash
+bash <skill_dir>/scripts/make-call.sh "<phone_number>" "<first_message>"
+```
+
+Both arguments are required:
+
+- `$1` — Phone number in E.164 format
+- `$2` — The first message the recipient hears when they pick up
+
+### Crafting the first message
+
+The first message is what the recipient hears immediately when they answer. Always include:
+
+1. **Who** is calling — "Hey, this is Dalo from Ressl AI"
+2. **Why** — the reason for the call
+3. **Context** — enough so the conversation can start naturally
+
+Keep it conversational, 1-2 sentences max. The recipient is hearing this spoken aloud.
 
 ### When to call
 
@@ -42,18 +55,19 @@ Use the `vapi_call` tool to call someone. You need:
 
 ### Example
 
-User: "Call Sarah and ask if the deploy is ready"
+User: "Call Kush and ask if the deploy is ready"
 
-1. Look up Sarah's phone number in the directory
-2. Call with context so you remember why:
+1. Look up Kush's phone number in BUSINESS.md → +918160376548
+2. Make the call with context in the first message:
 
-```
-vapi_call({
-  to: "+15551234567",
-  greeting: "Hi Sarah, this is your AI assistant calling about the deploy.",
-  context: "Ask Sarah if the production deploy is ready to go. Report back to the user."
-})
+```bash
+bash <skill_dir>/scripts/make-call.sh "+918160376548" "Hey Kush, this is Dalo. Calling to check if the production deploy is ready to go."
 ```
 
-3. When Sarah picks up and responds, you'll see your context and can have the conversation.
-4. After the call, relay the result back to the user on their original channel.
+3. Tell the user the call was placed.
+
+## Checking Call Status
+
+```bash
+bash <skill_dir>/scripts/get-call.sh "<call_id>"
+```

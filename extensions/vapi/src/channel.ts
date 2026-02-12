@@ -172,9 +172,7 @@ export function createVapiChannelPlugin(deps: {
         if (!cleaned || !cleaned.startsWith("+")) {
           return {
             ok: false,
-            error: new Error(
-              "VAPI requires a phone number in E.164 format (e.g. +15551234567). Use the vapi_call tool for outbound calls.",
-            ),
+            error: new Error("VAPI requires a phone number in E.164 format (e.g. +15551234567)."),
           };
         }
         return { ok: true, to: cleaned };
