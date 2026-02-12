@@ -6,10 +6,20 @@ import type {
   RuntimeEnv,
 } from "openclaw/plugin-sdk";
 import { execFileSync, spawn } from "node:child_process";
-import { createReplyPrefixOptions, resolveChannelMediaMaxBytes } from "openclaw/plugin-sdk";
+import {
+  createReplyPrefixOptions,
+  DEFAULT_ACCOUNT_ID,
+  resolveChannelMediaMaxBytes,
+} from "openclaw/plugin-sdk";
 import { getEmailRuntime } from "../runtime.js";
 import { resolveEmailAccount } from "./accounts.js";
-import { createGmailClient, getAttachment, getMessage, type GmailClient } from "./client.js";
+import {
+  createGmailClient,
+  getAttachment,
+  getHistory,
+  getMessage,
+  type GmailClient,
+} from "./client.js";
 import { htmlToPlainText } from "./html.js";
 import { sendEmailMessage } from "./send.js";
 import { buildEmailSessionKey, extractLatestContent, resolveReplyRecipients } from "./threading.js";
@@ -25,7 +35,7 @@ export type MonitorEmailOpts = {
 const RECENT_MESSAGE_TTL_MS = 10 * 60_000;
 const RECENT_MESSAGE_MAX = 2000;
 const ADDRESS_IN_USE_RE = /address already in use|EADDRINUSE/i;
-const DEFAULT_GMAIL_SERVE_PORT = 8790;
+const DEFAULT_GMAIL_SERVE_PORT = 8788;
 const DEFAULT_GMAIL_SERVE_BIND = "127.0.0.1";
 const DEFAULT_RENEW_MINUTES = 12 * 60;
 
@@ -107,9 +117,151 @@ function buildMediaPayload(mediaList: MediaInfo[]): Record<string, unknown> {
 
 type EmailInboundPayload = {
   messageId?: string;
+  messageIds?: string[];
+  messages?: Array<{ id?: string; messageId?: string }>;
   historyId?: string;
   emailAddress?: string;
+  data?: {
+    messageId?: string;
+    messageIds?: string[];
+    messages?: Array<{ id?: string; messageId?: string }>;
+    historyId?: string;
+    emailAddress?: string;
+  };
 };
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  return value as Record<string, unknown>;
+}
+
+function normalizeMessageId(raw: unknown): string | null {
+  if (typeof raw !== "string") {
+    return null;
+  }
+  const trimmed = raw.trim();
+  return trimmed ? trimmed : null;
+}
+
+function pushMessageId(target: Set<string>, raw: unknown): void {
+  const id = normalizeMessageId(raw);
+  if (id) {
+    target.add(id);
+  }
+}
+
+function collectMessageIdsFromNode(target: Set<string>, node: unknown): void {
+  const rec = asRecord(node);
+  if (!rec) {
+    return;
+  }
+  pushMessageId(target, rec.messageId);
+  pushMessageId(target, rec.id);
+
+  const messageIds = rec.messageIds;
+  if (Array.isArray(messageIds)) {
+    for (const value of messageIds) {
+      pushMessageId(target, value);
+    }
+  }
+
+  const messages = rec.messages;
+  if (Array.isArray(messages)) {
+    for (const message of messages) {
+      const messageRec = asRecord(message);
+      if (!messageRec) {
+        continue;
+      }
+      pushMessageId(target, messageRec.messageId);
+      pushMessageId(target, messageRec.id);
+    }
+  }
+}
+
+export function extractInboundMessageIds(payload: unknown): string[] {
+  const ids = new Set<string>();
+  collectMessageIdsFromNode(ids, payload);
+  const rec = asRecord(payload);
+  if (rec) {
+    collectMessageIdsFromNode(ids, rec.data);
+  }
+  return Array.from(ids);
+}
+
+function resolveInboundHistoryId(payload: unknown): string | null {
+  const rec = asRecord(payload);
+  if (!rec) {
+    return null;
+  }
+  const top = normalizeMessageId(rec.historyId);
+  if (top) {
+    return top;
+  }
+  return normalizeMessageId(asRecord(rec.data)?.historyId);
+}
+
+function waitForAbort(signal: AbortSignal): Promise<void> {
+  if (signal.aborted) {
+    return Promise.resolve();
+  }
+  return new Promise<void>((resolve) => {
+    signal.addEventListener("abort", () => resolve(), { once: true });
+  });
+}
+
+export function buildDefaultEmailHookUrl(gatewayPort: number, accountId: string): string {
+  const base = `http://127.0.0.1:${gatewayPort}/email/inbound`;
+  if (accountId === DEFAULT_ACCOUNT_ID) {
+    return base;
+  }
+  const params = new URLSearchParams({ accountId });
+  return `${base}?${params.toString()}`;
+}
+
+export function ensureEmailHookUrlAccountId(hookUrl: string, accountId: string): string {
+  if (accountId === DEFAULT_ACCOUNT_ID) {
+    return hookUrl;
+  }
+  try {
+    const parsed = new URL(hookUrl);
+    if (!parsed.searchParams.has("accountId")) {
+      parsed.searchParams.set("accountId", accountId);
+    }
+    return parsed.toString();
+  } catch {
+    const separator = hookUrl.includes("?") ? "&" : "?";
+    return `${hookUrl}${separator}accountId=${encodeURIComponent(accountId)}`;
+  }
+}
+
+function extractExecOutput(value: unknown): string {
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    return trimmed;
+  }
+  if (value instanceof Buffer) {
+    const trimmed = value.toString("utf-8").trim();
+    return trimmed;
+  }
+  return "";
+}
+
+function describeExecError(err: unknown): string {
+  if (!err || typeof err !== "object") {
+    return String(err);
+  }
+  const rec = err as {
+    message?: unknown;
+    stderr?: unknown;
+    stdout?: unknown;
+  };
+  const message = typeof rec.message === "string" ? rec.message.trim() : String(err);
+  const stderr = extractExecOutput(rec.stderr);
+  const stdout = extractExecOutput(rec.stdout);
+  return [message, stderr, stdout].filter(Boolean).join(" | ");
+}
 
 export type EmailInboundHandler = (
   req: { body: unknown; headers: Record<string, string | undefined> },
@@ -126,14 +278,10 @@ export function createEmailInboundHandler(opts: {
 
     try {
       const payload = req.body as EmailInboundPayload;
-      const messageId = payload?.messageId;
-      if (!messageId) {
+      let messageIds = extractInboundMessageIds(payload);
+      const historyId = messageIds.length === 0 ? resolveInboundHistoryId(payload) : null;
+      if (messageIds.length === 0 && !historyId) {
         res.status(200).json({ ok: true, skipped: "no messageId" });
-        return;
-      }
-
-      if (recentInboundMessages.check(`${opts.accountId}:${messageId}`)) {
-        res.status(200).json({ ok: true, skipped: "duplicate" });
         return;
       }
 
@@ -143,8 +291,37 @@ export function createEmailInboundHandler(opts: {
         return;
       }
 
-      await processInboundEmail({ client, messageId, accountId: opts.accountId, logger });
-      res.status(200).json({ ok: true });
+      if (messageIds.length === 0) {
+        if (!historyId) {
+          res.status(200).json({ ok: true, skipped: "no messageId" });
+          return;
+        }
+        try {
+          messageIds = await getHistory(client, historyId);
+        } catch (err) {
+          logger.debug?.(
+            `email: failed to resolve historyId ${historyId} for ${opts.accountId}: ${String(err)}`,
+          );
+        }
+      }
+
+      if (messageIds.length === 0) {
+        res.status(200).json({ ok: true, skipped: "no messageId" });
+        return;
+      }
+
+      const pending = messageIds.filter(
+        (messageId) => !recentInboundMessages.check(`${opts.accountId}:${messageId}`),
+      );
+      if (pending.length === 0) {
+        res.status(200).json({ ok: true, skipped: "duplicate" });
+        return;
+      }
+
+      for (const messageId of pending) {
+        await processInboundEmail({ client, messageId, accountId: opts.accountId, logger });
+      }
+      res.status(200).json({ ok: true, processed: pending.length });
     } catch (err) {
       logger.error?.(`email inbound error: ${String(err)}`);
       res.status(500).json({ error: String(err) });
@@ -384,16 +561,14 @@ export async function monitorEmailProvider(opts: MonitorEmailOpts = {}): Promise
 
   logger.debug?.(`email: connected as ${account.gmailAddress}`);
   opts.statusSink?.({
-    running: true,
     connected: true,
     lastConnectedAt: Date.now(),
-    lastStartAt: Date.now(),
+    lastError: null,
   });
 
   // Register the inbound handler for HTTP route callbacks
   emailClients.set(account.accountId, client);
 
-  // Try to start gog gmail watch if available
   const servePort = account.config.servePort ?? DEFAULT_GMAIL_SERVE_PORT;
   const serveBind = account.config.serveBind ?? DEFAULT_GMAIL_SERVE_BIND;
   const renewMinutes = account.config.renewEveryMinutes ?? DEFAULT_RENEW_MINUTES;
@@ -401,139 +576,171 @@ export async function monitorEmailProvider(opts: MonitorEmailOpts = {}): Promise
   const pushToken = account.config.pushToken ?? "";
   const topic = account.config.pubsubTopic ?? "";
 
-  if (topic && pushToken) {
-    // Build gog args for spawning gmail watch serve
-    const gatewayPort =
-      (typeof (cfg as Record<string, unknown>).gateway === "object" &&
-        (cfg as { gateway?: { port?: number } }).gateway?.port) ||
-      18789;
-    const hookUrl = account.config.hookUrl ?? `http://127.0.0.1:${gatewayPort}/email/inbound`;
+  let watcherProcess: ChildProcess | null = null;
+  let renewInterval: ReturnType<typeof setInterval> | null = null;
+  let shuttingDown = false;
 
-    const serveArgs = [
-      "gmail",
-      "watch",
-      "serve",
-      "--account",
-      account.gmailAddress,
-      "--bind",
-      serveBind,
-      "--port",
-      String(servePort),
-      "--path",
-      "/gmail-pubsub",
-      "--token",
-      pushToken,
-      "--hook-url",
-      hookUrl,
-      ...(hookToken ? ["--hook-token", hookToken] : []),
-      "--include-body",
-    ];
+  const cleanup = () => {
+    if (shuttingDown) {
+      return;
+    }
+    shuttingDown = true;
+    if (renewInterval) {
+      clearInterval(renewInterval);
+      renewInterval = null;
+    }
+    if (watcherProcess) {
+      watcherProcess.kill("SIGTERM");
+      watcherProcess = null;
+    }
+    emailClients.delete(account.accountId);
+    opts.statusSink?.({
+      connected: false,
+      lastStopAt: Date.now(),
+    });
+  };
 
-    const startArgs = [
-      "gmail",
-      "watch",
-      "start",
-      "--account",
-      account.gmailAddress,
-      "--label",
-      account.config.watchLabel ?? "INBOX",
-      "--topic",
-      topic,
-    ];
+  try {
+    if (topic && pushToken) {
+      const gatewayPort =
+        (typeof (cfg as Record<string, unknown>).gateway === "object" &&
+          (cfg as { gateway?: { port?: number } }).gateway?.port) ||
+        18789;
+      const hookUrl = ensureEmailHookUrlAccountId(
+        account.config.hookUrl ?? buildDefaultEmailHookUrl(gatewayPort, account.accountId),
+        account.accountId,
+      );
 
-    let watcherProcess: ChildProcess | null = null;
-    let renewInterval: ReturnType<typeof setInterval> | null = null;
-    let shuttingDown = false;
+      const serveArgs = [
+        "gmail",
+        "watch",
+        "serve",
+        "--account",
+        account.gmailAddress,
+        "--bind",
+        serveBind,
+        "--port",
+        String(servePort),
+        "--path",
+        "/gmail-pubsub",
+        "--token",
+        pushToken,
+        "--hook-url",
+        hookUrl,
+        ...(hookToken ? ["--hook-token", hookToken] : []),
+        "--include-body",
+      ];
 
-    const spawnServe = (): ChildProcess => {
-      let addressInUse = false;
-      const child = spawn("gog", serveArgs, {
-        stdio: ["ignore", "pipe", "pipe"],
-        detached: false,
-      });
+      const startArgs = [
+        "gmail",
+        "watch",
+        "start",
+        "--account",
+        account.gmailAddress,
+        "--label",
+        account.config.watchLabel ?? "INBOX",
+        "--topic",
+        topic,
+      ];
 
-      child.stdout?.on("data", (data: Buffer) => {
-        const line = data.toString().trim();
-        if (line) {
+      const runWatchStart = (phase: "initial" | "renewal"): boolean => {
+        try {
+          execFileSync("gog", startArgs, { timeout: 120_000, stdio: "pipe" });
+          if (phase === "initial") {
+            logger.debug?.(`email: watch started for ${account.gmailAddress}`);
+            opts.statusSink?.({ lastError: null });
+          }
+          return true;
+        } catch (err) {
+          const detail = describeExecError(err);
+          const message = `email watch ${phase} failed: ${detail}`;
+          if (phase === "initial") {
+            logger.error?.(message);
+          } else {
+            logger.debug?.(message);
+          }
+          opts.statusSink?.({ lastError: message });
+          return false;
+        }
+      };
+
+      const spawnServe = (): ChildProcess => {
+        let addressInUse = false;
+        const child = spawn("gog", serveArgs, {
+          stdio: ["ignore", "pipe", "pipe"],
+          detached: false,
+        });
+
+        child.stdout?.on("data", (data: Buffer) => {
+          const line = data.toString().trim();
+          if (line) {
+            logger.debug?.(`[gog] ${line}`);
+          }
+        });
+
+        child.stderr?.on("data", (data: Buffer) => {
+          const line = data.toString().trim();
+          if (!line) {
+            return;
+          }
+          if (ADDRESS_IN_USE_RE.test(line)) {
+            addressInUse = true;
+          }
           logger.debug?.(`[gog] ${line}`);
-        }
-      });
+        });
 
-      child.stderr?.on("data", (data: Buffer) => {
-        const line = data.toString().trim();
-        if (!line) {
-          return;
-        }
-        if (ADDRESS_IN_USE_RE.test(line)) {
-          addressInUse = true;
-        }
-        logger.debug?.(`[gog] ${line}`);
-      });
+        child.on("error", (err) => {
+          const message = `gog process error: ${String(err)}`;
+          logger.error?.(message);
+          opts.statusSink?.({ lastError: message });
+        });
 
-      child.on("error", (err) => {
-        logger.error?.(`gog process error: ${String(err)}`);
-      });
-
-      child.on("exit", (code, signal) => {
-        if (shuttingDown) {
-          return;
-        }
-        if (addressInUse) {
-          logger.debug?.("gog serve failed to bind (address already in use); stopping restarts.");
-          watcherProcess = null;
-          return;
-        }
-        logger.debug?.(`gog exited (code=${code}, signal=${signal}); restarting in 5s`);
-        watcherProcess = null;
-        setTimeout(() => {
+        child.on("exit", (code, signal) => {
           if (shuttingDown) {
             return;
           }
-          watcherProcess = spawnServe();
-        }, 5000);
-      });
+          if (addressInUse) {
+            const message = "gog serve failed to bind (address already in use); stopping restarts.";
+            logger.error?.(message);
+            opts.statusSink?.({ lastError: message });
+            watcherProcess = null;
+            return;
+          }
+          logger.debug?.(`gog exited (code=${code}, signal=${signal}); restarting in 5s`);
+          watcherProcess = null;
+          setTimeout(() => {
+            if (shuttingDown) {
+              return;
+            }
+            watcherProcess = spawnServe();
+          }, 5000);
+        });
 
-      return child;
-    };
+        return child;
+      };
 
-    // Start watch registration
-    try {
-      execFileSync("gog", startArgs, { timeout: 120_000, stdio: "pipe" });
-      logger.debug?.(`email: watch started for ${account.gmailAddress}`);
-    } catch (err) {
-      logger.debug?.(`email: watch start failed (continuing): ${String(err)}`);
+      runWatchStart("initial");
+      watcherProcess = spawnServe();
+      renewInterval = setInterval(() => {
+        if (shuttingDown) {
+          return;
+        }
+        runWatchStart("renewal");
+      }, renewMinutes * 60_000);
+    } else {
+      const message =
+        "email inbound watcher disabled: set channels.email.pubsubTopic and channels.email.pushToken.";
+      logger.debug?.(message);
+      opts.statusSink?.({ lastError: message });
     }
 
-    watcherProcess = spawnServe();
-
-    // Renewal interval
-    renewInterval = setInterval(() => {
-      if (shuttingDown) {
-        return;
-      }
-      try {
-        execFileSync("gog", startArgs, { timeout: 120_000, stdio: "pipe" });
-      } catch {
-        // Renewal failure is non-fatal
-      }
-    }, renewMinutes * 60_000);
-
-    // Cleanup on abort
-    opts.abortSignal?.addEventListener("abort", () => {
-      shuttingDown = true;
-      if (renewInterval) {
-        clearInterval(renewInterval);
-      }
-      if (watcherProcess) {
-        watcherProcess.kill("SIGTERM");
-      }
-      emailClients.delete(account.accountId);
-      opts.statusSink?.({
-        running: false,
-        connected: false,
-        lastStopAt: Date.now(),
-      });
-    });
+    if (opts.abortSignal) {
+      await waitForAbort(opts.abortSignal);
+    } else {
+      await new Promise<void>(() => {});
+    }
+  } finally {
+    cleanup();
   }
 }
 

@@ -79,12 +79,13 @@ export const emailPlugin: ChannelPlugin<ResolvedEmailAccount> = {
         accountId,
         clearBaseFields: ["gmailAddress", "credentialsPath", "tokenPath", "name"],
       }),
-    isConfigured: (account) => Boolean(account.gmailAddress && account.credentialsPath),
+    isConfigured: (account) =>
+      Boolean(account.gmailAddress && account.credentialsPath && account.tokenPath),
     describeAccount: (account) => ({
       accountId: account.accountId,
       name: account.name,
       enabled: account.enabled,
-      configured: Boolean(account.gmailAddress && account.credentialsPath),
+      configured: Boolean(account.gmailAddress && account.credentialsPath && account.tokenPath),
       gmailAddress: account.gmailAddress,
     }),
     resolveAllowFrom: ({ cfg, accountId }) =>
