@@ -7,6 +7,7 @@ import {
   deleteAccountFromConfigSection,
   applyAccountNameToChannelSection,
   type ChannelPlugin,
+  type ChannelAccountSnapshot,
 } from "openclaw/plugin-sdk";
 import { EmailConfigSchema } from "./config-schema.js";
 import {
@@ -170,7 +171,7 @@ export const emailPlugin: ChannelPlugin<ResolvedEmailAccount> = {
       lastStartAt: snapshot.lastStartAt ?? null,
       lastStopAt: snapshot.lastStopAt ?? null,
       lastError: snapshot.lastError ?? null,
-      gmailAddress: snapshot.gmailAddress ?? null,
+      gmailAddress: (snapshot as Record<string, unknown>).gmailAddress ?? null,
     }),
     buildAccountSnapshot: ({ account, runtime }) => ({
       accountId: account.accountId,
@@ -199,8 +200,9 @@ export const emailPlugin: ChannelPlugin<ResolvedEmailAccount> = {
         name,
       }),
     validateInput: ({ input }) => {
-      const gmailAddress = input.gmailAddress ?? input.email;
-      const credentialsPath = input.credentialsPath;
+      const raw = input as Record<string, unknown>;
+      const gmailAddress = raw.gmailAddress ?? raw.email;
+      const credentialsPath = raw.credentialsPath;
       if (!gmailAddress) {
         return "Email requires a Gmail address (--gmail-address).";
       }
@@ -210,9 +212,10 @@ export const emailPlugin: ChannelPlugin<ResolvedEmailAccount> = {
       return null;
     },
     applyAccountConfig: ({ cfg, accountId, input }) => {
-      const gmailAddress = input.gmailAddress ?? input.email;
-      const credentialsPath = input.credentialsPath;
-      const tokenPath = input.tokenPath;
+      const raw = input as Record<string, unknown>;
+      const gmailAddress = raw.gmailAddress ?? raw.email;
+      const credentialsPath = raw.credentialsPath;
+      const tokenPath = raw.tokenPath;
       const namedConfig = applyAccountNameToChannelSection({
         cfg,
         channelKey: "email",
@@ -262,7 +265,7 @@ export const emailPlugin: ChannelPlugin<ResolvedEmailAccount> = {
       ctx.setStatus({
         accountId: account.accountId,
         gmailAddress: account.gmailAddress,
-      });
+      } as ChannelAccountSnapshot & { gmailAddress?: string });
       ctx.log?.info(`[${account.accountId}] starting email channel`);
       return monitorEmailProvider({
         accountId: account.accountId,

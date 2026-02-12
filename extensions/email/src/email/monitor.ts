@@ -18,6 +18,8 @@ import {
   getAttachment,
   getHistory,
   getMessage,
+  listUnreadMessageIds,
+  markAsRead,
   type GmailClient,
 } from "./client.js";
 import { htmlToPlainText } from "./html.js";
@@ -580,7 +582,7 @@ export async function monitorEmailProvider(opts: MonitorEmailOpts = {}): Promise
   let renewInterval: ReturnType<typeof setInterval> | null = null;
   let shuttingDown = false;
 
-  const cleanup = () => {
+  let cleanup = () => {
     if (shuttingDown) {
       return;
     }
@@ -728,10 +730,58 @@ export async function monitorEmailProvider(opts: MonitorEmailOpts = {}): Promise
         runWatchStart("renewal");
       }, renewMinutes * 60_000);
     } else {
-      const message =
-        "email inbound watcher disabled: set channels.email.pubsubTopic and channels.email.pushToken.";
-      logger.debug?.(message);
-      opts.statusSink?.({ lastError: message });
+      // Polling mode — no Pub/Sub configured, poll for unread emails
+      const pollSeconds = account.config.pollIntervalSeconds ?? 30;
+      logger.debug?.(
+        `email: Pub/Sub not configured, falling back to polling every ${pollSeconds}s for ${account.gmailAddress}`,
+      );
+      opts.statusSink?.({ lastError: null });
+
+      const runPoll = async () => {
+        try {
+          const messageIds = await listUnreadMessageIds(client);
+          const pending = messageIds.filter(
+            (id) => !recentInboundMessages.check(`${account.accountId}:${id}`),
+          );
+          if (pending.length > 0) {
+            logger.debug?.(`email poll: ${pending.length} new message(s)`);
+          }
+          for (const messageId of pending) {
+            try {
+              await processInboundEmail({
+                client,
+                messageId,
+                accountId: account.accountId,
+                logger,
+              });
+              await markAsRead(client, messageId);
+            } catch (err) {
+              logger.error?.(`email poll: failed to process ${messageId}: ${String(err)}`);
+            }
+          }
+        } catch (err) {
+          logger.error?.(`email poll error: ${String(err)}`);
+          opts.statusSink?.({ lastError: `poll error: ${String(err)}` });
+        }
+      };
+
+      // Initial poll
+      await runPoll();
+
+      // Set up recurring poll
+      const pollTimer = setInterval(() => {
+        if (shuttingDown) return;
+        runPoll().catch(() => {});
+      }, pollSeconds * 1000);
+
+      // Register cleanup for the poll timer
+      const origCleanup = cleanup;
+      const patchedCleanup = () => {
+        clearInterval(pollTimer);
+        origCleanup();
+      };
+      // Replace cleanup reference for the finally block
+      cleanup = patchedCleanup;
     }
 
     if (opts.abortSignal) {

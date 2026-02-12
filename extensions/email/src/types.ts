@@ -39,6 +39,8 @@ export type EmailAccountConfig = {
   hookUrl?: string;
   /** Hook token for authenticating gog callbacks. */
   hookToken?: string;
+  /** Polling interval in seconds when Pub/Sub is not configured. Default: 30. */
+  pollIntervalSeconds?: number;
 };
 
 export type EmailConfig = {

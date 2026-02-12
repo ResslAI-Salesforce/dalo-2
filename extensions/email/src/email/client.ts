@@ -142,6 +142,28 @@ function extractAttachments(parts: gmail_v1.Schema$MessagePart[] | undefined): E
   return attachments;
 }
 
+export async function listUnreadMessageIds(
+  client: GmailClient,
+  query = "in:inbox is:unread",
+): Promise<string[]> {
+  const res = await client.gmail.users.messages.list({
+    userId: "me",
+    q: query,
+    maxResults: 25,
+  });
+  return (res.data.messages ?? []).map((m) => m.id!).filter(Boolean);
+}
+
+export async function markAsRead(client: GmailClient, messageId: string): Promise<void> {
+  await client.gmail.users.messages.modify({
+    userId: "me",
+    id: messageId,
+    requestBody: {
+      removeLabelIds: ["UNREAD"],
+    },
+  });
+}
+
 export async function getMessage(client: GmailClient, messageId: string): Promise<ParsedEmail> {
   const res = await client.gmail.users.messages.get({
     userId: "me",

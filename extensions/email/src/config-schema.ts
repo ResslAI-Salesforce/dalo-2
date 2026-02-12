@@ -22,6 +22,7 @@ const EmailAccountSchemaBase = z
     renewEveryMinutes: z.number().int().positive().optional(),
     hookUrl: z.string().optional(),
     hookToken: z.string().optional(),
+    pollIntervalSeconds: z.number().int().positive().optional(),
   })
   .strict();
 

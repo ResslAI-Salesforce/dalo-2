@@ -322,6 +322,9 @@ importers:
       openclaw:
         specifier: workspace:*
         version: link:../..
+      typescript:
+        specifier: ^5.5.0
+        version: 5.9.3
 
   extensions/feishu:
     dependencies:

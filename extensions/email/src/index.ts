@@ -1,9 +1,9 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { emptyPluginConfigSchema } from "openclaw/plugin-sdk";
-import { emailPlugin } from "./src/channel.js";
-import { createEmailInboundHandler, getEmailClient } from "./src/email/monitor.js";
-import { setEmailRuntime } from "./src/runtime.js";
+import { emailPlugin } from "./channel.js";
+import { createEmailInboundHandler, getEmailClient } from "./email/monitor.js";
+import { setEmailRuntime } from "./runtime.js";
 
 function parseBody(req: IncomingMessage): Promise<unknown> {
   return new Promise((resolve, reject) => {
