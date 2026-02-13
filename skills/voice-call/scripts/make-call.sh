@@ -26,7 +26,10 @@ BODY=$(jq -n \
     assistantId: $aid,
     phoneNumberId: $pid,
     customer: { number: $num },
-    assistantOverrides: { firstMessage: $msg }
+    assistantOverrides: { 
+      firstMessage: $msg,
+      variableValues: { callerId: $num }
+    }
   }')
 
 curl -s -X POST "https://api.vapi.ai/call/phone" \

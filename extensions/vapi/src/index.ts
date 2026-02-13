@@ -65,6 +65,13 @@ const vapiPlugin = {
     let outbound: OutboundManager | null = null;
     let fastify: ReturnType<typeof Fastify> | null = null;
 
+    // Track active calls: callId -> caller phone number
+    // Populated from /chat/completions and /events, used by /api/action
+    const activeCallsMap = new Map<string, string>();
+
+    // Track most recent caller for single-call fallback
+    let currentActiveCaller: string | null = null;
+
     // Bridge plugin logger to the shape OutboundManager expects
     const logBridge = {
       info: (...args: unknown[]) => logger.info(args.map(String).join(" ")),
@@ -122,6 +129,11 @@ const vapiPlugin = {
             `[vapi] ${isOutbound ? "outbound" : "inbound"} call ${callId} from ${callerNumber}`,
           );
 
+          // Track caller for /api/action lookups
+          if (callerNumber && callerNumber !== "unknown") {
+            activeCallsMap.set(callId, callerNumber);
+          }
+
           // Extract latest user message from the conversation history
           const userMessages = body.messages?.filter((m) => m.role === "user") || [];
           const latestMessage = userMessages[userMessages.length - 1]?.content;
@@ -158,7 +170,9 @@ const vapiPlugin = {
               peer: { kind: "direct", id: callerNumber },
             });
 
-            const sessionKey = route.sessionKey ?? `agent:main:vapi:dm:${callerNumber}`;
+            // Always use a VAPI-specific session key so it doesn't share
+            // sessions with Slack/email (which would route replies there).
+            const sessionKey = `agent:main:vapi:dm:${callerNumber}`;
 
             // Build MsgContext for the inbound message
             const msgCtx = api.runtime.channel.reply.finalizeInboundContext({
@@ -180,9 +194,145 @@ const vapiPlugin = {
             const { dispatcher, replyOptions, markDispatchIdle } =
               api.runtime.channel.reply.createReplyDispatcherWithTyping({
                 deliver: async (payload: { text?: string }) => {
+                  logger.info(
+                    `[vapi] deliver called: payload=${JSON.stringify(payload)?.slice(0, 200)}`,
+                  );
                   const text = payload?.text;
                   if (text) {
                     writeChunk(reply.raw, callId, text);
+                  } else {
+                    logger.info(`[vapi] deliver called but no text in payload`);
+                  }
+                },
+              });
+
+            logger.info(`[vapi] dispatching reply for session=${sessionKey}`);
+            await api.runtime.channel.reply.dispatchReplyFromConfig({
+              ctx: msgCtx,
+              cfg,
+              dispatcher,
+              replyOptions,
+            });
+            logger.info(`[vapi] dispatch complete for call ${callId}`);
+
+            markDispatchIdle?.();
+            endStream(reply.raw, callId);
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            logger.error(`[vapi] Call ${callId} agent error: ${msg}`);
+            writeChunk(reply.raw, callId, "Sorry, something went wrong. Please try again.");
+            endStream(reply.raw, callId);
+          }
+        });
+
+        // ── POST /api/action ───────────────────────────────────────────────
+        //
+        // Tool endpoint for VAPI apiRequest tools. Receives natural language
+        // requests and executes them via OpenClaw, returning the result.
+        //
+        // This enables a hybrid architecture where VAPI handles conversation
+        // natively (fast) and only calls OpenClaw for actions that need tools.
+        //
+        // Request body:
+        //   { "request": "email John about the meeting", "caller": "+91...", "callId": "..." }
+        //
+        // Response:
+        //   { "success": true, "result": "Email sent to John about the meeting." }
+
+        fastify.post("/api/action", async (request: FastifyRequest, reply: FastifyReply) => {
+          const body = request.body as Record<string, unknown>;
+          const query = request.query as Record<string, unknown>;
+
+          // Log full request to debug what VAPI sends
+          logger.info(`[vapi] Action raw body: ${JSON.stringify(body).slice(0, 500)}`);
+          logger.info(`[vapi] Action query params: ${JSON.stringify(query)}`);
+
+          const actionRequest = typeof body.request === "string" ? body.request : undefined;
+
+          // Get callId from query/body
+          const callId =
+            (typeof query.callId === "string" && !query.callId.includes("{{")
+              ? query.callId
+              : null) ||
+            (typeof body.callId === "string" && !String(body.callId).includes("{{")
+              ? body.callId
+              : null) ||
+            randomUUID();
+
+          // Try to get caller from: 1) query params, 2) body, 3) activeCallsMap lookup, 4) unknown
+          let callerNumber =
+            (typeof query.caller === "string" && !query.caller.includes("{{")
+              ? query.caller
+              : null) ||
+            (typeof body.caller === "string" && !String(body.caller).includes("{{")
+              ? body.caller
+              : null);
+
+          // If caller not provided or is a template literal, look up from active calls
+          if (!callerNumber) {
+            callerNumber = activeCallsMap.get(callId) || currentActiveCaller || "unknown";
+            if (callerNumber !== "unknown") {
+              logger.info(`[vapi] Resolved caller ${callerNumber} from tracking`);
+            }
+          }
+
+          // Clean up caller number - trim whitespace and ensure + prefix
+          if (callerNumber && callerNumber !== "unknown") {
+            callerNumber = callerNumber.trim();
+            if (!callerNumber.startsWith("+") && /^\d/.test(callerNumber)) {
+              callerNumber = "+" + callerNumber;
+            }
+          }
+
+          logger.info(
+            `[vapi] Action request from ${callerNumber}: ${actionRequest?.slice(0, 100)}`,
+          );
+
+          if (!actionRequest) {
+            return reply.status(400).send({
+              success: false,
+              error: "Missing 'request' field",
+            });
+          }
+
+          try {
+            const cfg = api.config;
+
+            // Use a dedicated session for tool calls to avoid mixing with voice conversation
+            const sessionKey = `agent:main:vapi:tool:${callerNumber}`;
+
+            // Build context for the agent
+            const toolContext = `[VAPI Tool Call] Caller phone: ${callerNumber}
+
+You have full access to workspace files (USER.md, TOOLS.md, MEMORY.md, contacts). 
+If you need to identify the caller or find their Slack/email, check these files first.
+The caller's phone number can be matched to their identity in your workspace.
+
+Execute this request and return a concise result suitable for voice response (1-2 sentences max).`;
+
+            // Use Provider: "api" to avoid cross-context messaging restrictions
+            // This allows the agent to send to email/Slack from a tool call
+            const msgCtx = api.runtime.channel.reply.finalizeInboundContext({
+              Body: actionRequest,
+              From: callerNumber,
+              To: callerNumber,
+              SessionKey: sessionKey,
+              ChatType: "direct",
+              Provider: "api",
+              Surface: "api",
+              SenderId: callerNumber,
+              SenderE164: callerNumber,
+              UntrustedContext: [toolContext],
+            });
+
+            // Collect the response instead of streaming
+            let responseText = "";
+
+            const { dispatcher, replyOptions, markDispatchIdle } =
+              api.runtime.channel.reply.createReplyDispatcherWithTyping({
+                deliver: async (payload: { text?: string }) => {
+                  if (payload?.text) {
+                    responseText += payload.text;
                   }
                 },
               });
@@ -195,14 +345,255 @@ const vapiPlugin = {
             });
 
             markDispatchIdle?.();
-            endStream(reply.raw, callId);
+
+            logger.info(
+              `[vapi] Action completed for ${callerNumber}: ${responseText.slice(0, 100)}`,
+            );
+
+            return reply.status(200).send({
+              success: true,
+              result: responseText || "Action completed.",
+            });
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
-            logger.error(`[vapi] Call ${callId} agent error: ${msg}`);
-            writeChunk(reply.raw, callId, "Sorry, something went wrong. Please try again.");
-            endStream(reply.raw, callId);
+            logger.error(`[vapi] Action error for ${callerNumber}: ${msg}`);
+            return reply.status(500).send({
+              success: false,
+              error: "Failed to execute action. Please try again.",
+            });
           }
         });
+
+        // ── POST /assistant-selector ──────────────────────────────────────
+        //
+        // Assistant selector for inbound calls. VAPI calls this endpoint when
+        // a call comes in, and we return the assistant ID + variableValues
+        // with the caller's phone number so tools can identify who's calling.
+        //
+        // Configure in VAPI: Set "Server URL" to this endpoint.
+        //
+        // Request from VAPI:
+        //   { "message": { "type": "assistant-request", "call": { "customer": { "number": "+91..." } } } }
+        //
+        // Response:
+        //   { "assistantId": "...", "assistantOverrides": { "variableValues": { "callerId": "+91..." } } }
+
+        // ── POST /server (Server URL for custom tools) ─────────────────────
+        //
+        // Handles all VAPI server messages including:
+        // - assistant-request: Return assistant config for inbound calls
+        // - tool-calls: Execute custom function tools
+        // - Other events: Acknowledge
+        //
+        // Custom tools receive full call context including customer.number!
+
+        fastify.post("/server", async (request: FastifyRequest, reply: FastifyReply) => {
+          const body = request.body as Record<string, unknown>;
+          const message = body.message as Record<string, unknown> | undefined;
+          const messageType = message?.type as string | undefined;
+
+          // Extract call info from any event type
+          const call = message?.call as Record<string, unknown> | undefined;
+          const callId = call?.id as string | undefined;
+          const customer = call?.customer as Record<string, unknown> | undefined;
+          let callerNumber = customer?.number as string | undefined;
+
+          // Clean up caller number
+          if (callerNumber) {
+            callerNumber = callerNumber.trim();
+            if (!callerNumber.startsWith("+") && /^\d/.test(callerNumber)) {
+              callerNumber = "+" + callerNumber;
+            }
+          }
+
+          logger.info(
+            `[vapi] Server message: type=${messageType} caller=${callerNumber || "unknown"}`,
+          );
+
+          // Track caller for /api/action lookups (critical for api_request tools)
+          if (callId && callerNumber) {
+            activeCallsMap.set(callId, callerNumber);
+          }
+          if (callerNumber) {
+            currentActiveCaller = callerNumber;
+          }
+
+          // ── Handle assistant-request ──────────────────────────────────────
+          if (messageType === "assistant-request") {
+            logger.info(`[vapi] Assistant request from ${callerNumber || "unknown"}`);
+
+            return reply.status(200).send({
+              assistantId: config.assistant_id,
+              assistantOverrides: {
+                variableValues: {
+                  callerId: callerNumber || "unknown",
+                },
+              },
+            });
+          }
+
+          // ── Handle tool-calls (custom function execution) ─────────────────
+          if (messageType === "tool-calls") {
+            // Debug: log the raw message structure to see what VAPI sends
+            logger.info(`[vapi] Tool-calls raw message: ${JSON.stringify(message).slice(0, 1000)}`);
+
+            // VAPI sends toolCalls (not toolCallList) with function.name and function.arguments
+            const toolCallList = (message?.toolCallList || message?.toolCalls) as
+              | Array<{
+                  id: string;
+                  name?: string;
+                  function?: { name: string; arguments: Record<string, unknown> | string };
+                  arguments?: Record<string, unknown>;
+                }>
+              | undefined;
+
+            if (!toolCallList || toolCallList.length === 0) {
+              return reply.status(200).send({ results: [] });
+            }
+
+            const results: Array<{ toolCallId: string; result: string }> = [];
+
+            for (const toolCall of toolCallList) {
+              // Handle both formats: direct (name, arguments) or nested (function.name, function.arguments)
+              const toolName = toolCall.name || toolCall.function?.name;
+              let toolArgs = toolCall.arguments || toolCall.function?.arguments;
+
+              // VAPI sometimes sends arguments as a JSON string
+              if (typeof toolArgs === "string") {
+                try {
+                  toolArgs = JSON.parse(toolArgs);
+                } catch {
+                  toolArgs = { request: toolArgs };
+                }
+              }
+
+              const toolCallId = toolCall.id;
+
+              logger.info(
+                `[vapi] Tool call: ${toolName} from ${callerNumber || "unknown"} args=${JSON.stringify(toolArgs).slice(0, 200)}`,
+              );
+
+              // Handle do_action tool
+              if (toolName === "do_action") {
+                const argsObj = (toolArgs || {}) as Record<string, unknown>;
+                const actionRequest = argsObj.request as string | undefined;
+
+                if (!actionRequest) {
+                  results.push({ toolCallId, result: "No request provided." });
+                  continue;
+                }
+
+                try {
+                  const cfg = api.config;
+                  const sessionKey = `agent:main:vapi:tool:${callerNumber || "unknown"}`;
+
+                  const toolContext = `[VAPI Tool Call] Caller phone: ${callerNumber || "unknown"}
+
+You have full access to workspace files (USER.md, TOOLS.md, MEMORY.md, contacts). 
+If you need to identify the caller or find their Slack/email, check these files first.
+The caller's phone number can be matched to their identity in your workspace.
+
+Execute this request and return a concise result suitable for voice response (1-2 sentences max).`;
+
+                  const msgCtx = api.runtime.channel.reply.finalizeInboundContext({
+                    Body: actionRequest,
+                    From: callerNumber || "unknown",
+                    To: callerNumber || "unknown",
+                    SessionKey: sessionKey,
+                    ChatType: "direct",
+                    Provider: "api",
+                    Surface: "api",
+                    SenderId: callerNumber || "unknown",
+                    SenderE164: callerNumber || "unknown",
+                    UntrustedContext: [toolContext],
+                  });
+
+                  let responseText = "";
+                  const { dispatcher, replyOptions, markDispatchIdle } =
+                    api.runtime.channel.reply.createReplyDispatcherWithTyping({
+                      deliver: async (payload: { text?: string }) => {
+                        if (payload?.text) {
+                          responseText += payload.text;
+                        }
+                      },
+                    });
+
+                  await api.runtime.channel.reply.dispatchReplyFromConfig({
+                    ctx: msgCtx,
+                    cfg,
+                    dispatcher,
+                    replyOptions,
+                  });
+
+                  markDispatchIdle?.();
+
+                  logger.info(`[vapi] Tool completed: ${responseText.slice(0, 100)}`);
+                  results.push({ toolCallId, result: responseText || "Action completed." });
+                } catch (err) {
+                  const msg = err instanceof Error ? err.message : String(err);
+                  logger.error(`[vapi] Tool error: ${msg}`);
+                  results.push({ toolCallId, result: "Failed to execute action." });
+                }
+              } else {
+                // Unknown tool
+                results.push({ toolCallId, result: `Unknown tool: ${toolName}` });
+              }
+            }
+
+            return reply.status(200).send({ results });
+          }
+
+          // ── Handle end-of-call ────────────────────────────────────────────
+          if (messageType === "end-of-call-report") {
+            logger.info(`[vapi] Call ended`);
+          }
+
+          // For all other events, just acknowledge
+          return reply.status(200).send({ ok: true });
+        });
+
+        // ── POST /assistant-selector ─────────────────────────────────────
+        //
+        // VAPI calls this endpoint when an inbound call arrives to determine
+        // which assistant to use. We return the configured assistant ID and
+        // inject the caller's phone number into variableValues so the
+        // {{callerId}} variable is available in tool URLs (same as outbound).
+        //
+        fastify.post(
+          "/assistant-selector",
+          async (request: FastifyRequest, reply: FastifyReply) => {
+            const body = request.body as Record<string, unknown>;
+            const call = body?.call as Record<string, unknown> | undefined;
+            const customer = call?.customer as Record<string, unknown> | undefined;
+            const customerNumber = (customer?.number as string) || "unknown";
+
+            // Use configured assistant_id, or fall back to env var
+            const assistantId = config.assistant_id || process.env.VAPI_ASSISTANT_ID;
+
+            if (!assistantId) {
+              logger.error("[vapi] No assistant_id configured for inbound calls");
+              return reply.status(500).send({ error: "No assistant configured" });
+            }
+
+            logger.info(`[vapi] Inbound call from ${customerNumber} → assistant ${assistantId}`);
+
+            // Track this caller for /api/action lookups
+            const callId = call?.id as string | undefined;
+            if (callId && customerNumber !== "unknown") {
+              activeCallsMap.set(callId, customerNumber);
+              currentActiveCaller = customerNumber;
+            }
+
+            return reply.send({
+              assistantId,
+              assistantOverrides: {
+                variableValues: {
+                  callerId: customerNumber,
+                },
+              },
+            });
+          },
+        );
 
         // ── POST /events ──────────────────────────────────────────────────
         //
@@ -214,12 +605,20 @@ const vapiPlugin = {
           const type = event?.message?.type;
           const callId = event?.message?.call?.id;
 
+          // Track caller from events
+          const customerNumber = event?.message?.call?.customer?.number;
+          if (callId && customerNumber) {
+            activeCallsMap.set(callId, customerNumber);
+          }
+
           switch (type) {
             case "end-of-call-report": {
               const report = event.message as Record<string, unknown>;
               logger.info(
                 `[vapi] Call ${callId} ended — reason=${report.endedReason} duration=${report.durationSeconds}s`,
               );
+              // Clean up ended call from map
+              if (callId) activeCallsMap.delete(callId);
               break;
             }
             case "status-update":
