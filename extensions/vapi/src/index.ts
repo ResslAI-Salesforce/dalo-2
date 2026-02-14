@@ -544,8 +544,92 @@ Execute this request and return a concise result suitable for voice response (1-
           }
 
           // ── Handle end-of-call ────────────────────────────────────────────
+          //
+          // When a call ends, VAPI sends the full transcript and call metadata.
+          // We route this to OpenClaw so the agent can process it (e.g., summarize
+          // and email dispatch, log to CRM, etc.).
+          //
           if (messageType === "end-of-call-report") {
-            logger.info(`[vapi] Call ended`);
+            const report = message as Record<string, unknown>;
+            const transcript = report.transcript as string | undefined;
+            const summary = report.summary as string | undefined;
+            const durationSeconds = report.durationSeconds as number | undefined;
+            const endedReason = report.endedReason as string | undefined;
+            const recordingUrl = report.recordingUrl as string | undefined;
+
+            logger.info(
+              `[vapi] Call ended — caller=${callerNumber || "unknown"} duration=${durationSeconds}s reason=${endedReason}`,
+            );
+
+            // Only process if we have a transcript
+            if (transcript || summary) {
+              try {
+                const cfg = api.config;
+                // Use a dedicated session for post-call processing
+                const sessionKey = `agent:main:vapi:post-call:${callerNumber || callId || "unknown"}`;
+
+                // Build context for the agent with all call details
+                const callContext = `[VAPI End-of-Call Report]
+
+A phone call just ended. Process this according to your post-call-summary skill.
+
+CALL DETAILS:
+- Caller: ${callerNumber || "Unknown"}
+- Duration: ${durationSeconds ? `${Math.floor(durationSeconds / 60)}m ${durationSeconds % 60}s` : "Unknown"}
+- Ended: ${endedReason || "Unknown reason"}
+${recordingUrl ? `- Recording: ${recordingUrl}` : ""}
+
+${summary ? `CALL SUMMARY:\n${summary}\n` : ""}
+FULL TRANSCRIPT:
+${transcript || "No transcript available"}
+
+---
+Process this call according to your workspace instructions (check skills/post-call-summary if available).`;
+
+                const msgCtx = api.runtime.channel.reply.finalizeInboundContext({
+                  Body: callContext,
+                  From: callerNumber || "system",
+                  To: "agent",
+                  SessionKey: sessionKey,
+                  ChatType: "direct",
+                  Provider: "vapi",
+                  Surface: "vapi",
+                  SenderId: callerNumber || "system",
+                  SenderE164: callerNumber || undefined,
+                });
+
+                // Dispatch to agent — we don't need the response streamed back
+                // since this is async post-call processing
+                let responseText = "";
+                const { dispatcher, replyOptions, markDispatchIdle } =
+                  api.runtime.channel.reply.createReplyDispatcherWithTyping({
+                    deliver: async (payload: { text?: string }) => {
+                      if (payload?.text) {
+                        responseText += payload.text;
+                      }
+                    },
+                  });
+
+                await api.runtime.channel.reply.dispatchReplyFromConfig({
+                  ctx: msgCtx,
+                  cfg,
+                  dispatcher,
+                  replyOptions,
+                });
+
+                markDispatchIdle?.();
+
+                logger.info(
+                  `[vapi] Post-call processing complete for ${callerNumber}: ${responseText.slice(0, 100)}`,
+                );
+              } catch (err) {
+                const msg = err instanceof Error ? err.message : String(err);
+                logger.error(`[vapi] Post-call processing error: ${msg}`);
+              }
+            }
+
+            // Clean up call tracking
+            if (callId) activeCallsMap.delete(callId);
           }
 
           // For all other events, just acknowledge
