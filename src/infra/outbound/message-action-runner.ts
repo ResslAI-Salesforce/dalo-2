@@ -78,7 +78,17 @@ function resolveAndApplyOutboundThreadId(
     ctx.channel === "telegram" && !threadId
       ? resolveTelegramAutoThreadId({ to: ctx.to, toolContext: ctx.toolContext })
       : undefined;
-  const resolved = threadId ?? slackAutoThreadId ?? telegramAutoThreadId;
+  // [agent-registry/extensions/email] Auto-resolve threadId for email from toolContext.
+  // Without this, the `message` tool sends email replies as new threads instead of
+  // replying in the original Gmail thread. The email plugin's threading.buildToolContext
+  // maps MessageThreadId → currentThreadTs; this line reads it back so the outbound
+  // sendText/sendMedia can look up In-Reply-To/References headers for proper threading.
+  // Same pattern as Slack/Telegram auto-resolution above.
+  const emailAutoThreadId =
+    ctx.channel === "email" && !threadId && ctx.toolContext?.currentThreadTs
+      ? ctx.toolContext.currentThreadTs
+      : undefined;
+  const resolved = threadId ?? slackAutoThreadId ?? telegramAutoThreadId ?? emailAutoThreadId;
   // Write auto-resolved threadId back into params so downstream dispatch
   // (plugin `readStringParam(params, "threadId")`) picks it up.
   if (resolved && !params.threadId) {
